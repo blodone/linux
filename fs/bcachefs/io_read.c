@@ -259,6 +259,7 @@ static struct bch_read_bio *__promote_alloc(struct btree_trans *trans,
 			&orig->opts,
 			update_opts,
 			btree_id, k);
+	op->write.type = BCH_DATA_UPDATE_promote;
 	/*
 	 * possible errors: -BCH_ERR_nocow_lock_blocked,
 	 * -BCH_ERR_ENOSPC_disk_reservation:
@@ -393,7 +394,7 @@ static inline struct bch_read_bio *bch2_rbio_free(struct bch_read_bio *rbio)
 
 	if (rbio->have_ioref) {
 		struct bch_dev *ca = bch2_dev_have_ref(rbio->c, rbio->pick.ptr.dev);
-		percpu_ref_put(&ca->io_ref);
+		percpu_ref_put(&ca->io_ref[READ]);
 	}
 
 	if (rbio->split) {
@@ -486,6 +487,8 @@ static void bch2_rbio_retry(struct work_struct *work)
 		.inum	= rbio->read_pos.inode,
 	};
 	struct bch_io_failures failed = { .nr = 0 };
+	int orig_error = rbio->ret;
+
 	struct btree_trans *trans = bch2_trans_get(c);
 
 	trace_io_read_retry(&rbio->bio);
@@ -518,7 +521,9 @@ static void bch2_rbio_retry(struct work_struct *work)
 	if (ret) {
 		rbio->ret = ret;
 		rbio->bio.bi_status = BLK_STS_IOERR;
-	} else {
+	} else if (orig_error != -BCH_ERR_data_read_retry_csum_err_maybe_userspace &&
+		   orig_error != -BCH_ERR_data_read_ptr_stale_race &&
+		   !failed.nr) {
 		struct printbuf buf = PRINTBUF;
 
 		lockrestart_do(trans,
@@ -908,7 +913,7 @@ static noinline void read_from_stale_dirty_pointer(struct btree_trans *trans,
 
 		prt_printf(&buf, "memory gen: %u", gen);
 
-		ret = lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_slot(&iter)));
+		ret = lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_slot(trans, &iter)));
 		if (!ret) {
 			prt_newline(&buf);
 			bch2_bkey_val_to_text(&buf, c, k);
@@ -976,7 +981,8 @@ retry_pick:
 		goto err;
 	}
 
-	if (unlikely(bch2_csum_type_is_encryption(pick.crc.csum_type)) && !c->chacha20) {
+	if (unlikely(bch2_csum_type_is_encryption(pick.crc.csum_type)) &&
+	    !c->chacha20_key_set) {
 		struct printbuf buf = PRINTBUF;
 		bch2_read_err_msg_trans(trans, &buf, orig, read_pos);
 		prt_printf(&buf, "attempting to read encrypted data without encryption key\n  ");
@@ -1002,7 +1008,7 @@ retry_pick:
 	    unlikely(dev_ptr_stale(ca, &pick.ptr))) {
 		read_from_stale_dirty_pointer(trans, ca, k, pick.ptr);
 		bch2_mark_io_failure(failed, &pick, false);
-		percpu_ref_put(&ca->io_ref);
+		percpu_ref_put(&ca->io_ref[READ]);
 		goto retry_pick;
 	}
 
@@ -1035,7 +1041,7 @@ retry_pick:
 		 */
 		if (pick.crc.compressed_size > u->op.wbio.bio.bi_iter.bi_size) {
 			if (ca)
-				percpu_ref_put(&ca->io_ref);
+				percpu_ref_put(&ca->io_ref[READ]);
 			rbio->ret = -BCH_ERR_data_read_buffer_too_small;
 			goto out_read_done;
 		}
@@ -1284,12 +1290,12 @@ int __bch2_read(struct btree_trans *trans, struct bch_read_bio *rbio,
 		if (ret)
 			goto err;
 
-		bch2_btree_iter_set_snapshot(&iter, snapshot);
+		bch2_btree_iter_set_snapshot(trans, &iter, snapshot);
 
-		bch2_btree_iter_set_pos(&iter,
+		bch2_btree_iter_set_pos(trans, &iter,
 				POS(inum.inum, bvec_iter.bi_sector));
 
-		k = bch2_btree_iter_peek_slot(&iter);
+		k = bch2_btree_iter_peek_slot(trans, &iter);
 		ret = bkey_err(k);
 		if (ret)
 			goto err;
@@ -1322,13 +1328,14 @@ int __bch2_read(struct btree_trans *trans, struct bch_read_bio *rbio,
 		ret = __bch2_read_extent(trans, rbio, bvec_iter, iter.pos,
 					 data_btree, k,
 					 offset_into_extent, failed, flags, -1);
+		swap(bvec_iter.bi_size, bytes);
+
 		if (ret)
 			goto err;
 
 		if (flags & BCH_READ_last_fragment)
 			break;
 
-		swap(bvec_iter.bi_size, bytes);
 		bio_advance_iter(&rbio->bio, &bvec_iter, bytes);
 err:
 		if (ret == -BCH_ERR_data_read_retry_csum_err_maybe_userspace)
@@ -1342,14 +1349,16 @@ err:
 
 	bch2_trans_iter_exit(trans, &iter);
 
-	if (ret) {
-		struct printbuf buf = PRINTBUF;
-		lockrestart_do(trans,
-			bch2_inum_offset_err_msg_trans(trans, &buf, inum,
-						       bvec_iter.bi_sector << 9));
-		prt_printf(&buf, "read error: %s", bch2_err_str(ret));
-		bch_err_ratelimited(c, "%s", buf.buf);
-		printbuf_exit(&buf);
+	if (unlikely(ret)) {
+		if (ret != -BCH_ERR_extent_poisoned) {
+			struct printbuf buf = PRINTBUF;
+			lockrestart_do(trans,
+				       bch2_inum_offset_err_msg_trans(trans, &buf, inum,
+								      bvec_iter.bi_sector << 9));
+			prt_printf(&buf, "data read error: %s", bch2_err_str(ret));
+			bch_err_ratelimited(c, "%s", buf.buf);
+			printbuf_exit(&buf);
+		}
 
 		rbio->bio.bi_status	= BLK_STS_IOERR;
 		rbio->ret		= ret;
